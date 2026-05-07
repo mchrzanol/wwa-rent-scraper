@@ -24,8 +24,10 @@ export const loadConfig = (): AppConfig => ({
     rooms: 3,
     maxTotalPrice: 5000,
     maxBaseRent: Number(process.env.MAX_BASE_RENT ?? 4000),
-    maxWalkingMeters: 1500,
-    haversinePrefilterMeters: 1800,
+    maxWalkingMeters: Number(process.env.MAX_WALKING_METERS ?? 1500),
+    haversinePrefilterMeters: Number(
+      process.env.HAVERSINE_PREFILTER_METERS ?? Number(process.env.MAX_WALKING_METERS ?? 1500) * 1.2,
+    ),
   },
   proxyFile: process.env.PROXY_FILE ?? './proxy.txt',
   ors: {

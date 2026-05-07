@@ -1,6 +1,12 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { AppConfig } from '../config/configuration';
 import { APP_CONFIG } from '../playwright/playwright.service';
+
+interface AggregatedResult {
+  costs: ParsedCosts;
+  address: ExtractedAddress | null;
+}
 
 export interface ParsedCosts {
   rentPrice?: number;       // base rent stated in description (PLN)
@@ -49,6 +55,28 @@ Rules:
 export class AiParserService {
   private readonly logger = new Logger(AiParserService.name);
   private static readonly RATE_LIMIT_BACKOFFS_MS = [1000, 3000, 5000];
+
+  /**
+   * In-memory cache keyed by SHA-1 of the description text. Same description
+   * scraped from multiple portals (agency reposts) will hit AI exactly once
+   * within the TTL window. Wiped on restart anyway.
+   *
+   * Bounded by both:
+   *   - TTL (default 24h, override via AI_CACHE_TTL_MS)
+   *   - max size (default 5000 entries, override via AI_CACHE_MAX_SIZE) —
+   *     when full, oldest entries are dropped (Map preserves insertion order).
+   */
+  private static readonly AI_CACHE_TTL_MS = Number(
+    process.env.AI_CACHE_TTL_MS ?? 24 * 60 * 60 * 1000,
+  );
+  private static readonly AI_CACHE_MAX_SIZE = Number(
+    process.env.AI_CACHE_MAX_SIZE ?? 5000,
+  );
+  private readonly aiCache = new Map<
+    string,
+    { value: AggregatedResult; expiresAt: number }
+  >();
+  private aiCacheHits = 0;
 
   /** Some OR providers ignore response_format and wrap JSON in ```json fences. */
   private stripJsonFence(s: string): string {
@@ -161,25 +189,12 @@ export class AiParserService {
 
   /**
    * Hybrid: regex first, then LLM if regex couldn't find adminFee. Returns
-   * the merged best guess.
+   * the merged best guess. Backed by description-hash cache shared with
+   * resolveAddress — so a listing using both ends up calling AI at most once.
    */
   async resolveCosts(description: string): Promise<ParsedCosts> {
-    const regex = this.regexExtract(description);
-    if (regex.adminFee && regex.confidence >= 0.7) return regex;
-
-    try {
-      const ai = await this.aiExtract(description);
-      return {
-        ...regex,
-        ...ai,
-        // Take whichever path actually found an adminFee
-        adminFee: ai.adminFee ?? regex.adminFee,
-        deposit: ai.deposit ?? regex.deposit,
-      };
-    } catch (err) {
-      this.logger.warn(`AI extract failed, returning regex only: ${(err as Error).message}`);
-      return regex;
-    }
+    const all = await this.extractAll(description);
+    return all.costs;
   }
 
   /**
@@ -238,6 +253,80 @@ export class AiParserService {
 
     return null;
   }
+
+  private static readonly COMBINED_PROMPT = `You extract structured information from a Polish real-estate listing description. ONE response covers TWO tasks:
+
+OUTPUT: STRICT JSON, single line, no code fences, no commentary.
+SCHEMA:
+{
+  "rentPrice": int|null,
+  "adminFee": int|null,
+  "utilities": int|null,
+  "deposit": int|null,
+  "costsConfidence": 0..1,
+  "costsNotes": string|null,
+  "street": string|null,
+  "number": string|null,
+  "landmark": string|null,
+  "addressConfidence": 0..1
+}
+
+================================================================
+TASK A — COSTS
+================================================================
+- adminFee = the building/administrative fee paid to the housing cooperative
+  ("czynsz administracyjny", "czynsz dla wspólnoty", "opłaty stałe",
+  "czynsz (dodatkowo)", "czynsz dla wspólnoty"). Integer PLN.
+- DO NOT roll utility estimates ("media", "prąd", "gaz", "woda") into adminFee.
+- deposit = "kaucja". Integer PLN.
+- rentPrice / utilities are optional best-effort.
+- Use null for unknown values.
+- costsConfidence reflects how explicit the adminFee figure is in the text.
+
+================================================================
+TASK B — ADDRESS / LOCATION ANCHOR
+================================================================
+You ALMOST ALWAYS find a street. Polish listings nearly always name the street, but the "ul." prefix is often DROPPED. Look at every capitalized word — if it looks like a Polish street name (proper noun, often ends in -ska/-cka/-owa/-skiej/-ka/-a), it IS the street unless it is clearly a district name. Read the WHOLE description before deciding.
+
+DISAMBIGUATION (NEVER put these in "street")
+  Districts / neighbourhoods: Mokotów, Stary Mokotów, Wola, Praga, Praga-Północ, Praga-Południe, Saska Kępa, Ursynów, Bemowo, Wilanów, Bielany, Białołęka, Targówek, Ochota, Włochy, Żoliborz, Śródmieście, Wesoła, Rembertów, Wawer.
+  Cities / regions: Warszawa, Mazowsze, Mazowieckie.
+  General terms: "centrum", "blisko centrum", "okolice".
+
+If no street, fall back to landmark — anything geocodable in OSM:
+  - Metro: "stacja metra Pole Mokotowskie" → "Metro Pole Mokotowskie"
+  - Residential complex: "Mennica Residence", "Browary Warszawskie"
+  - Mall / POI: "Galeria Mokotów", "CH Westfield Mokotów"
+  - Park / square: "Pole Mokotowskie", "plac Konstytucji"
+
+ADDRESS NORMALIZATION
+  Output street in nominative if you can confidently invert the case ("Kolejowej" → "Kolejowa", "Saskiej" → "Saska"). If unsure keep as written.
+  Strip "ul./ulica/al./aleja/plac" from output.
+  number: digits only and optional letter ("12", "12A"); strip apartment suffix like "/4".
+
+ADDRESS CONFIDENCE SCALE
+  0.95 — explicit street + number ("ul. X 12", "Stańczyka 5")
+  0.85 — explicit street name without a number ("ul. X", "X to ulica", "Lokalizacja: X")
+  0.75 — declined street form ("na Saskiej", "przy Marszałkowskiej") OR clear landmark
+  0.5  — ambiguous mention
+  0.0  — only district / city / generic phrasing
+
+================================================================
+EXAMPLES
+================================================================
+INPUT: "Wynajmę mieszkanie. Dokładny adres Stańczyka 5, 3 piętro. Czynsz administracyjny 800 zł, kaucja 4000 zł."
+OUTPUT: {"rentPrice":null,"adminFee":800,"utilities":null,"deposit":4000,"costsConfidence":0.9,"costsNotes":null,"street":"Stańczyka","number":"5","landmark":null,"addressConfidence":0.95}
+
+INPUT: "Mieszkanie przy ul. Kolejowej 19/4. Najem 3500 zł + 700 zł czynsz."
+OUTPUT: {"rentPrice":3500,"adminFee":700,"utilities":null,"deposit":null,"costsConfidence":0.8,"costsNotes":null,"street":"Kolejowa","number":"19","landmark":null,"addressConfidence":0.95}
+
+INPUT: "Apartament w kompleksie Mennica Residence na Mokotowie. 7000 zł + media."
+OUTPUT: {"rentPrice":7000,"adminFee":null,"utilities":null,"deposit":null,"costsConfidence":0.3,"costsNotes":"media wg zużycia","street":null,"number":null,"landmark":"Mennica Residence","addressConfidence":0.75}
+
+INPUT: "Mieszkanie w Starym Mokotowie. Świetna lokalizacja. 4500 zł czynsz."
+OUTPUT: {"rentPrice":4500,"adminFee":null,"utilities":null,"deposit":null,"costsConfidence":0.0,"costsNotes":null,"street":null,"number":null,"landmark":null,"addressConfidence":0.0}
+
+REMEMBER: JSON ONLY. No \`\`\`. No prose. No trailing whitespace.`;
 
   private static readonly ADDRESS_PROMPT = `You extract Warsaw location anchors from Polish real-estate listing descriptions.
 
@@ -357,17 +446,183 @@ REMEMBER: JSON ONLY. No \`\`\`. No prose. No trailing whitespace.`;
    * neither path could extract anything plausible.
    */
   async resolveAddress(description: string): Promise<ExtractedAddress | null> {
-    const regex = this.regexExtractAddress(description);
-    if (regex && regex.confidence >= 0.8) return regex;
+    const all = await this.extractAll(description);
+    return all.address;
+  }
 
-    try {
-      const ai = await this.aiExtractAddress(description);
-      if (ai && ai.confidence >= 0.4) return ai;
-    } catch (err) {
-      this.logger.warn(`AI address extract failed: ${(err as Error).message}`);
+  /**
+   * Single source of truth for AI extraction. Runs regex on both fronts; if
+   * either is low-confidence it asks the LLM ONCE for both costs and address
+   * combined. Caches the merged result by SHA-1(description) so a repost
+   * (same text, different URL) hits AI exactly once.
+   */
+  private async extractAll(description: string): Promise<AggregatedResult> {
+    const key = createHash('sha1').update(description).digest('hex');
+    const now = Date.now();
+    const cached = this.aiCache.get(key);
+    if (cached) {
+      if (cached.expiresAt > now) {
+        this.aiCacheHits += 1;
+        this.logger.debug(`AI cache hit (${this.aiCacheHits} total) — key=${key.slice(0, 8)}`);
+        return cached.value;
+      }
+      // Expired — drop it and fall through to recomputation.
+      this.aiCache.delete(key);
     }
 
-    return regex; // may still be a low-confidence regex hit, or null
+    const regexCosts = this.regexExtract(description);
+    const regexAddress = this.regexExtractAddress(description);
+
+    const costsGoodEnough = regexCosts.adminFee != null && regexCosts.confidence >= 0.7;
+    const addressGoodEnough = regexAddress != null && regexAddress.confidence >= 0.8;
+
+    // Both regex paths solved it — no AI call needed.
+    if (costsGoodEnough && addressGoodEnough) {
+      const result: AggregatedResult = { costs: regexCosts, address: regexAddress };
+      this.cacheSet(key, result);
+      return result;
+    }
+
+    // At least one needs AI. One combined call covers both.
+    let ai: { costs?: ParsedCosts; address?: ExtractedAddress | null } = {};
+    try {
+      ai = await this.aiExtractAll(description);
+    } catch (err) {
+      this.logger.warn(`AI combined extract failed, falling back to regex: ${(err as Error).message}`);
+    }
+
+    const costs: ParsedCosts = ai.costs
+      ? {
+          ...regexCosts,
+          ...ai.costs,
+          adminFee: ai.costs.adminFee ?? regexCosts.adminFee,
+          deposit: ai.costs.deposit ?? regexCosts.deposit,
+        }
+      : regexCosts;
+
+    let address: ExtractedAddress | null = regexAddress;
+    if (ai.address && ai.address.confidence >= 0.4) {
+      address = ai.address;
+    }
+
+    const result: AggregatedResult = { costs, address };
+    this.cacheSet(key, result);
+    return result;
+  }
+
+  /**
+   * Inserts into the AI cache with TTL, opportunistically evicting expired
+   * entries and capping total size by dropping oldest (Map preserves insertion
+   * order, so first key is the oldest).
+   */
+  private cacheSet(key: string, value: AggregatedResult): void {
+    const now = Date.now();
+
+    // Light sweep: scan the first ~100 entries for expirations. Cheap, doesn't
+    // walk the whole map every write.
+    let scanned = 0;
+    for (const [k, v] of this.aiCache) {
+      if (scanned++ >= 100) break;
+      if (v.expiresAt <= now) this.aiCache.delete(k);
+    }
+
+    // Hard cap — drop oldest until we fit.
+    while (this.aiCache.size >= AiParserService.AI_CACHE_MAX_SIZE) {
+      const oldest = this.aiCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.aiCache.delete(oldest);
+    }
+
+    this.aiCache.set(key, {
+      value,
+      expiresAt: now + AiParserService.AI_CACHE_TTL_MS,
+    });
+  }
+
+  /**
+   * Single combined OpenRouter call returning BOTH cost and address in one
+   * response — halves spend / latency / rate-limit pressure compared to
+   * the two separate calls we used to make.
+   */
+  private async aiExtractAll(
+    description: string,
+  ): Promise<{ costs: ParsedCosts; address: ExtractedAddress | null }> {
+    if (!this.config.openrouter.apiKey) {
+      throw new Error('OPENROUTER_API_KEY not set');
+    }
+    this.logger.log(`→ OpenRouter call: combined extraction (model=${this.config.openrouter.model})`);
+
+    const res = await this.openRouterPost({
+      model: this.config.openrouter.model,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: AiParserService.COMBINED_PROMPT },
+        { role: 'user', content: description.slice(0, 6000) },
+      ],
+    });
+
+    if (!res.ok) {
+      throw new Error(`OpenRouter HTTP ${res.status}: ${await res.text()}`);
+    }
+
+    const json = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = json.choices?.[0]?.message?.content;
+    if (!content) throw new Error('OpenRouter response had no content');
+
+    let parsed: {
+      rentPrice?: number | null;
+      adminFee?: number | null;
+      utilities?: number | null;
+      deposit?: number | null;
+      costsConfidence?: number;
+      costsNotes?: string | null;
+      street?: string | null;
+      number?: string | null;
+      landmark?: string | null;
+      addressConfidence?: number;
+    };
+    try {
+      parsed = JSON.parse(this.stripJsonFence(content));
+    } catch (err) {
+      throw new Error(`Could not JSON.parse model output: ${(err as Error).message}`);
+    }
+
+    const costs: ParsedCosts = {
+      rentPrice: this.toIntOrUndef(parsed.rentPrice),
+      adminFee: this.toIntOrUndef(parsed.adminFee),
+      utilities: this.toIntOrUndef(parsed.utilities),
+      deposit: this.toIntOrUndef(parsed.deposit),
+      confidence:
+        typeof parsed.costsConfidence === 'number'
+          ? Math.max(0, Math.min(1, parsed.costsConfidence))
+          : 0,
+      notes: typeof parsed.costsNotes === 'string' ? parsed.costsNotes : undefined,
+    };
+
+    const street = typeof parsed.street === 'string' ? parsed.street.trim() : undefined;
+    const landmark = typeof parsed.landmark === 'string' ? parsed.landmark.trim() : undefined;
+    const address: ExtractedAddress | null =
+      street || landmark
+        ? {
+            street: street || undefined,
+            number: parsed.number ? String(parsed.number).trim() : undefined,
+            landmark: landmark || undefined,
+            confidence:
+              typeof parsed.addressConfidence === 'number'
+                ? Math.max(0, Math.min(1, parsed.addressConfidence))
+                : 0,
+            source: 'ai',
+          }
+        : null;
+
+    this.logger.log(
+      `← OpenRouter parsed costs(adminFee=${costs.adminFee ?? 'null'} conf=${costs.confidence}) address(${address ? `${address.street ?? address.landmark}` : 'null'} conf=${address?.confidence ?? 0})`,
+    );
+
+    return { costs, address };
   }
 
   private toIntOrUndef(v: unknown): number | undefined {
