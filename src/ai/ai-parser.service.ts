@@ -239,47 +239,64 @@ export class AiParserService {
     return null;
   }
 
-  private static readonly ADDRESS_PROMPT = `You extract Warsaw location anchors
-from Polish real-estate listing descriptions. Return STRICT JSON:
-{"street": "<street name in nominative without 'ul.' prefix, or null>", "number": "<building number or null>", "landmark": "<POI/metro station/residential complex/mall name in Warsaw, or null>", "confidence": 0..1}
+  private static readonly ADDRESS_PROMPT = `You extract Warsaw location anchors from Polish real-estate listing descriptions.
 
-PRIORITY (return the strongest anchor available):
-  1. STREET NAME — highest priority. Look HARD; streets in Polish text often
-     appear WITHOUT the "ul." prefix. Patterns to recognize (★ = explicit,
-     ◐ = implicit but reliable):
-       ★ "ul. Kolejowa 19" / "ulica Marszałkowska"
-       ★ "al. Jerozolimskie 100" / "Aleja Solidarności"
-       ★ "plac Bankowy" / "pl. Defilad"
-       ◐ "Bluszczańska to cicha ulica" — Bluszczańska is the street
-       ◐ "Mieszkanie przy Kolejowej" / "na Marszałkowskiej" — declined form
-       ◐ "Bluszczańska 12 / 4" — number after the bare name
-       ◐ "Lokalizacja: Bluszczańska, Mokotów" — header-style mention
-     Polish streets can appear in any grammatical case (genitive "Kolejowej",
-     locative "Kolejowej") — return them in the form as written or normalize
-     to nominative if confident. Nominatim handles either.
-     CRITICAL DISAMBIGUATION: "Stary Mokotów", "Saska Kępa", "Wola",
-     "Mokotów", "Śródmieście" are NEIGHBOURHOODS, NOT streets. Never put
-     them in "street". Same for "Warszawa".
+OUTPUT: STRICT JSON, single line, no code fences, no commentary.
+SCHEMA: {"street": string|null, "number": string|null, "landmark": string|null, "confidence": number}
 
-  2. LANDMARK — only if no street is mentioned. Anything geocodable in OSM:
-       - Metro: "stacja metra Pole Mokotowskie" → "Metro Pole Mokotowskie"
-       - Residential complex: "Mennica Residence", "Browary Warszawskie"
-       - Mall / POI: "Galeria Mokotów", "CH Westfield Mokotów"
-       - Park / square: "Pole Mokotowskie", "plac Konstytucji"
-     Pick the SPECIFIC anchor (the building / mall / station), not generic
-     references like "blisko parku".
+YOUR JOB
+You ALMOST ALWAYS find a street. Polish listings nearly always name the street, but the "ul." prefix is often DROPPED. Look at every capitalized word — if it looks like a Polish street name (proper noun, often ends in -ska/-cka/-owa/-skiej/-ka/-a), it IS the street unless it is clearly a district name. Read the WHOLE description before deciding.
 
-  3. If neither street nor landmark, return all-null with confidence 0.
+DISAMBIGUATION (NEVER put these in "street")
+  Districts / neighbourhoods: Mokotów, Stary Mokotów, Wola, Praga, Praga-Północ, Praga-Południe, Saska Kępa, Ursynów, Bemowo, Wilanów, Bielany, Białołęka, Targówek, Ochota, Włochy, Żoliborz, Śródmieście, Wesoła, Rembertów, Wawer.
+  Cities / regions: Warszawa, Mazowsze, Mazowieckie.
+  General terms: "centrum", "blisko centrum", "okolice".
 
-CONFIDENCE:
-  0.95 — explicit "ul. X 12" with number
-  0.85 — explicit "ul. X" or "X to ulica" pattern, no number
-  0.75 — declined street name in context ("przy Kolejowej")
-  0.7  — clear landmark (named building/mall/metro)
-  0.3  — vague hint
-  0.0  — nothing
+EXAMPLES (input → JSON output)
 
-OUTPUT JSON ONLY. No prose, no code fences, no comments.`;
+INPUT: "Wynajmę mieszkanie. Dokładny adres Stańczyka 5, 3 piętro."
+OUTPUT: {"street":"Stańczyka","number":"5","landmark":null,"confidence":0.95}
+
+INPUT: "Mieszkanie przy ul. Kolejowej 19/4 w Warszawie."
+OUTPUT: {"street":"Kolejowa","number":"19","landmark":null,"confidence":0.95}
+
+INPUT: "Bluszczańska to cicha ulica z dobrym dojazdem do centrum."
+OUTPUT: {"street":"Bluszczańska","number":null,"landmark":null,"confidence":0.85}
+
+INPUT: "Lokalizacja: Marszałkowska, Śródmieście."
+OUTPUT: {"street":"Marszałkowska","number":null,"landmark":null,"confidence":0.85}
+
+INPUT: "Apartament w kompleksie Mennica Residence na Mokotowie."
+OUTPUT: {"street":null,"number":null,"landmark":"Mennica Residence","confidence":0.75}
+
+INPUT: "5 minut piechotą od metra Pole Mokotowskie."
+OUTPUT: {"street":null,"number":null,"landmark":"Metro Pole Mokotowskie","confidence":0.7}
+
+INPUT: "Mieszkanie w Starym Mokotowie. Świetna lokalizacja."
+OUTPUT: {"street":null,"number":null,"landmark":null,"confidence":0.0}
+
+INPUT: "Lokal znajduje się na Saskiej, blisko Łazienek Królewskich."
+OUTPUT: {"street":"Saska","number":null,"landmark":null,"confidence":0.8}
+
+INPUT: "Przestronne mieszkanie w nowoczesnym apartamentowcu Browary Warszawskie. 3 pokoje, 80 m²."
+OUTPUT: {"street":null,"number":null,"landmark":"Browary Warszawskie","confidence":0.8}
+
+INPUT: "Mieszkanie 3-pokojowe ul. Pięknej 12/45 — 1 piętro, balkon."
+OUTPUT: {"street":"Piękna","number":"12","landmark":null,"confidence":0.95}
+
+CONFIDENCE SCALE
+  0.95 — explicit street + number ("ul. X 12", "Stańczyka 5")
+  0.85 — explicit street name without a number ("ul. X", "X to ulica", "Lokalizacja: X")
+  0.75 — declined street form ("na Saskiej", "przy Marszałkowskiej") OR clear landmark
+  0.5  — ambiguous mention
+  0.0  — only district / city / generic phrasing
+
+NORMALIZATION
+  Output street in nominative if you can confidently invert the case ("Kolejowej" → "Kolejowa", "Saskiej" → "Saska", "Stańczyka" stays "Stańczyka"). If unsure, keep as written. Nominatim handles either.
+  Strip "ul./ulica/al./aleja/plac" from output.
+  number: digits only and optional letter ("12", "12A"); strip any "/4", "/45" suffix (apartment number, irrelevant).
+
+REMEMBER: JSON ONLY. No \`\`\`. No prose. No trailing whitespace.`;
 
   async aiExtractAddress(description: string): Promise<ExtractedAddress | null> {
     if (!this.config.openrouter.apiKey) {
