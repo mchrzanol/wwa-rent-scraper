@@ -12,7 +12,6 @@ import { AppConfig } from '../config/configuration';
 import { APP_CONFIG } from '../playwright/playwright.service';
 import { PrismaService } from '../database/prisma.service';
 
-const SHEET_NAME = 'Listings';
 const HEADER = [
   'Created',
   'Portal',
@@ -24,6 +23,7 @@ const HEADER = [
   'Total',
   'Deposit',
   'Walk (m)',
+  'Walk approx?',
   'Nearest station',
   'Phone',
   'URL',
@@ -84,7 +84,7 @@ export class GoogleSheetsService implements OnModuleInit {
     try {
       await this.sheets.spreadsheets.values.append({
         spreadsheetId: this.config.sheets.spreadsheetId,
-        range: `${SHEET_NAME}!A:M`,
+        range: `${this.config.sheets.sheetName}!A:N`,
         valueInputOption: 'USER_ENTERED',
         insertDataOption: 'INSERT_ROWS',
         requestBody: { values },
@@ -108,7 +108,7 @@ export class GoogleSheetsService implements OnModuleInit {
     return JSON.parse(raw);
   }
 
-  private toRow(l: Listing): Array<string | number> {
+  private toRow(l: Listing): Array<string | number | boolean> {
     return [
       l.createdAt.toISOString(),
       l.portal,
@@ -119,9 +119,8 @@ export class GoogleSheetsService implements OnModuleInit {
       l.adminFee ?? '',
       l.totalPrice,
       l.deposit ?? '',
-      l.walkingApproximate
-        ? `~${l.walkingMeters ?? l.haversineMeters} (approx)`
-        : (l.walkingMeters ?? l.haversineMeters),
+      l.walkingMeters ?? l.haversineMeters,
+      l.walkingApproximate,
       l.nearestStation,
       l.phone ?? '',
       l.url,
@@ -129,7 +128,7 @@ export class GoogleSheetsService implements OnModuleInit {
   }
 
   /**
-   * Idempotent: ensures a tab named SHEET_NAME exists (creates if missing) and
+   * Idempotent: ensures a tab named this.config.sheets.sheetName exists (creates if missing) and
    * writes the header row only if A1 is empty.
    */
   private async ensureHeader(): Promise<void> {
@@ -139,34 +138,100 @@ export class GoogleSheetsService implements OnModuleInit {
         spreadsheetId: this.config.sheets.spreadsheetId,
       });
       const existing = (meta.data.sheets ?? []).some(
-        (s) => s.properties?.title === SHEET_NAME,
+        (s) => s.properties?.title === this.config.sheets.sheetName,
       );
 
       if (!existing) {
         await this.sheets.spreadsheets.batchUpdate({
           spreadsheetId: this.config.sheets.spreadsheetId,
           requestBody: {
-            requests: [{ addSheet: { properties: { title: SHEET_NAME } } }],
+            requests: [{ addSheet: { properties: { title: this.config.sheets.sheetName } } }],
           },
         });
-        this.logger.log(`Created Sheets tab "${SHEET_NAME}"`);
+        this.logger.log(`Created Sheets tab "${this.config.sheets.sheetName}"`);
       }
 
       const probe = await this.sheets.spreadsheets.values.get({
         spreadsheetId: this.config.sheets.spreadsheetId,
-        range: `${SHEET_NAME}!A1`,
+        range: `${this.config.sheets.sheetName}!A1`,
       });
       if (probe.data.values?.[0]?.[0]) return;
 
       await this.sheets.spreadsheets.values.update({
         spreadsheetId: this.config.sheets.spreadsheetId,
-        range: `${SHEET_NAME}!A1`,
+        range: `${this.config.sheets.sheetName}!A1`,
         valueInputOption: 'RAW',
         requestBody: { values: [HEADER] },
       });
       this.logger.log('Wrote Sheets header row');
+
+      await this.applyHeaderFormatting();
     } catch (err) {
       this.logger.warn(`ensureHeader skipped: ${(err as Error).message}`);
     }
+  }
+
+  /**
+   * Bolds the header row, freezes it, applies a banded background, and adds
+   * a basic filter — turns the raw values into a real "table" view.
+   */
+  private async applyHeaderFormatting(): Promise<void> {
+    if (!this.sheets) return;
+    const meta = await this.sheets.spreadsheets.get({
+      spreadsheetId: this.config.sheets.spreadsheetId,
+    });
+    const sheetId = (meta.data.sheets ?? []).find(
+      (s) => s.properties?.title === this.config.sheets.sheetName,
+    )?.properties?.sheetId;
+    if (sheetId == null) return;
+
+    await this.sheets.spreadsheets.batchUpdate({
+      spreadsheetId: this.config.sheets.spreadsheetId,
+      requestBody: {
+        requests: [
+          // Freeze header row
+          {
+            updateSheetProperties: {
+              properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
+              fields: 'gridProperties.frozenRowCount',
+            },
+          },
+          // Bold + grey background on header
+          {
+            repeatCell: {
+              range: { sheetId, startRowIndex: 0, endRowIndex: 1 },
+              cell: {
+                userEnteredFormat: {
+                  textFormat: { bold: true },
+                  backgroundColor: { red: 0.92, green: 0.92, blue: 0.95 },
+                  horizontalAlignment: 'CENTER',
+                },
+              },
+              fields: 'userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)',
+            },
+          },
+          // Auto-filter over all columns
+          {
+            setBasicFilter: {
+              filter: {
+                range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: HEADER.length },
+              },
+            },
+          },
+          // Auto-resize all columns to fit
+          {
+            autoResizeDimensions: {
+              dimensions: {
+                sheetId,
+                dimension: 'COLUMNS',
+                startIndex: 0,
+                endIndex: HEADER.length,
+              },
+            },
+          },
+        ],
+      },
+    });
+    this.logger.log('Applied Sheets header formatting (frozen, bold, filtered)');
   }
 }

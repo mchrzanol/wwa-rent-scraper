@@ -12,7 +12,7 @@ export interface AppConfig {
   openrouter: { apiKey: string; model: string };
   nominatim: { baseUrl: string; userAgent: string };
   discord: { webhookUrl: string };
-  sheets: { spreadsheetId: string; serviceAccountJson: string };
+  sheets: { spreadsheetId: string; serviceAccountJson: string; sheetName: string };
   database: { url: string };
 }
 
@@ -45,6 +45,7 @@ export const loadConfig = (): AppConfig => ({
   sheets: {
     spreadsheetId: process.env.GOOGLE_SHEETS_ID ?? '',
     serviceAccountJson: process.env.GOOGLE_SA_JSON ?? '',
+    sheetName: process.env.SHEET_NAME ?? 'Listings',
   },
   database: { url: process.env.DATABASE_URL ?? '' },
 });
