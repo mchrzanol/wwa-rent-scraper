@@ -23,7 +23,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }} # Your server's SSH private key
           port: ${{ secrets.PORT }} # SSH PORT
           script: |
-            cd /var/www/rent-scraper
+            cd /var/www/wwa-rent-scraper
             git pull
             npm ci
             npx prisma generate
