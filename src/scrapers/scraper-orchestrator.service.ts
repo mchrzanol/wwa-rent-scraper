@@ -233,7 +233,11 @@ export class ScraperOrchestratorService {
       this.logger.warn(`✗ ${tag} REJECT total_price_exceeded (${totalPrice} > ${this.config.filters.maxTotalPrice})`);
       return { kind: 'rejected', reason: 'total_price_exceeded' };
     }
-    this.logger.log(`  ✓ price OK (${totalPrice} ≤ ${this.config.filters.maxTotalPrice})`);
+    if (totalPrice < this.config.filters.minTotalPrice) {
+      this.logger.warn(`✗ ${tag} REJECT total_price_too_low (${totalPrice} < ${this.config.filters.minTotalPrice})`);
+      return { kind: 'rejected', reason: 'total_price_too_low' };
+    }
+    this.logger.log(`  ✓ price OK (${this.config.filters.minTotalPrice} ≤ ${totalPrice} ≤ ${this.config.filters.maxTotalPrice})`);
 
     // 3. Coordinates — scraper-provided wins; otherwise geocode at street level.
     let lat = raw.latitude;
@@ -323,27 +327,48 @@ export class ScraperOrchestratorService {
   private async resolveCoordinates(raw: RawListing) {
     const tries: string[] = [];
 
-    if (raw.title && /\b(ul\.?|ulica|al\.|aleja|plac|pl\.)\b/i.test(raw.title)) {
+    // Title try — only if it's clean (no separator junk like "|", "•" or all-caps).
+    // Noisy titles ("3 POKOJE | 60 MKW | SADYBA | UL. CZARNOMORSKA") confuse
+    // Nominatim and waste a request. Skip them entirely.
+    if (
+      raw.title &&
+      /\b(ul\.?|ulica|al\.|aleja|plac|pl\.)\b/i.test(raw.title) &&
+      !/[|•·]/.test(raw.title) &&
+      raw.title.length < 80
+    ) {
       tries.push(`${raw.title}, ${raw.district}`);
     }
 
     if (raw.rawDescription) {
       const extracted = await this.ai.resolveAddress(raw.rawDescription);
+      this.logger.log(
+        `  ↳ resolveAddress → ${
+          extracted
+            ? `street=${extracted.street ?? '–'} number=${extracted.number ?? '–'} landmark=${extracted.landmark ?? '–'} conf=${extracted.confidence} src=${extracted.source}`
+            : 'null'
+        }`,
+      );
       if (extracted) {
         if (extracted.street) {
+          const street = this.normalizeStreetCase(extracted.street);
           const num = extracted.number ? ` ${extracted.number}` : '';
-          tries.push(`ul. ${extracted.street}${num}, ${raw.district}`);
+          tries.push(`ul. ${street}${num}, ${raw.district}`);
+          // Also push without "ul." prefix — Nominatim sometimes prefers the
+          // bare form when the dictionary entry has no ul. tag.
+          if (extracted.number) tries.push(`${street} ${extracted.number}, Warszawa`);
         }
         if (extracted.landmark) {
           tries.push(`${extracted.landmark}, Warszawa`);
         }
       }
     }
+    this.logger.log(`  ↳ geocode tries: ${JSON.stringify(tries)}`);
 
     // First pass: only accept precise matches (street level or better).
     let coarseHit: import('../routing/geocoding.service').GeocodeHit | null = null;
     for (const query of tries) {
       const hit = await this.geocoding.geocode(query);
+      this.logger.log(`  ↳ geocode "${query}" → ${hit ? `${hit.precision} (${hit.displayName})` : 'null'}`);
       if (!hit) continue;
       if (hit.precision === 'area' || hit.precision === 'unknown') {
         coarseHit ??= hit; // keep the first coarse match in case nothing better turns up
@@ -364,6 +389,26 @@ export class ScraperOrchestratorService {
       );
     }
     return coarseHit;
+  }
+
+  /**
+   * Polish street names often appear in genitive ("Czarnomorskiej") in
+   * descriptions, but Nominatim has them indexed in nominative
+   * ("Czarnomorska"). Convert common adjective endings.
+   */
+  private normalizeStreetCase(street: string): string {
+    const parts = street.trim().split(/\s+/);
+    return parts
+      .map((p) =>
+        p
+          .replace(/skiej$/i, 'ska')
+          .replace(/ckiej$/i, 'cka')
+          .replace(/owej$/i, 'owa')
+          .replace(/nej$/i, 'na')
+          .replace(/łej$/i, 'ła')
+          .replace(/giej$/i, 'ga'),
+      )
+      .join(' ');
   }
 
   private toCreateInput(

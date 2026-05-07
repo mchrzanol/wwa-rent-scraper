@@ -3,6 +3,7 @@ export interface AppConfig {
     districts: string[];
     rooms: number;
     maxTotalPrice: number;
+    minTotalPrice: number;
     maxBaseRent: number;
     maxWalkingMeters: number;
     haversinePrefilterMeters: number;
@@ -11,6 +12,7 @@ export interface AppConfig {
   ors: { apiKey: string; baseUrl: string };
   openrouter: { apiKey: string; model: string };
   nominatim: { baseUrl: string; userAgent: string };
+  mapy: { apiKey: string };
   discord: { webhookUrl: string; statsWebhookUrl: string };
   sheets: { spreadsheetId: string; serviceAccountJson: string; sheetName: string };
   database: { url: string };
@@ -22,7 +24,8 @@ export const loadConfig = (): AppConfig => ({
       .split(',')
       .map((d) => d.trim()),
     rooms: 3,
-    maxTotalPrice: 5000,
+    maxTotalPrice: Number(process.env.MAX_TOTAL_PRICE ?? 5000),
+    minTotalPrice: Number(process.env.MIN_TOTAL_PRICE ?? 2500),
     maxBaseRent: Number(process.env.MAX_BASE_RENT ?? 4000),
     maxWalkingMeters: Number(process.env.MAX_WALKING_METERS ?? 1500),
     haversinePrefilterMeters: Number(
@@ -43,6 +46,7 @@ export const loadConfig = (): AppConfig => ({
     userAgent:
       process.env.NOMINATIM_USER_AGENT ?? 'rent-scraper/1.0 (set NOMINATIM_USER_AGENT)',
   },
+  mapy: { apiKey: process.env.MAPY_API_KEY ?? '' },
   discord: {
     webhookUrl: process.env.DISCORD_WEBHOOK_URL ?? '',
     statsWebhookUrl: process.env.DISCORD_STATS_WEBHOOK_URL ?? '',

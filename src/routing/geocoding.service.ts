@@ -44,6 +44,29 @@ export class GeocodingService {
     if (!key) return null;
     if (this.cache.has(key)) return this.cache.get(key) ?? null;
 
+    // Try Nominatim first (authoritative). If it returns null or area-level
+    // hit, retry with Mapy.cz Geocoding API — Nominatim is strict on Polish
+    // inflections; Mapy.cz handles them well and tolerates loose formatting.
+    const primary = await this.geocodeNominatim(query);
+    if (primary && primary.precision !== 'area' && primary.precision !== 'unknown') {
+      this.cache.set(key, primary);
+      return primary;
+    }
+
+    const fallback = await this.geocodeMapy(query);
+    if (fallback && fallback.precision !== 'area' && fallback.precision !== 'unknown') {
+      this.cache.set(key, fallback);
+      return fallback;
+    }
+
+    // Neither precise — return whichever non-null result we got, prefer Mapy
+    // (richer fuzzy match, more likely to land in the right ballpark).
+    const result = fallback ?? primary ?? null;
+    this.cache.set(key, result);
+    return result;
+  }
+
+  private async geocodeNominatim(query: string): Promise<GeocodeHit | null> {
     await this.throttle();
 
     const url = new URL('/search', this.config.nominatim.baseUrl);
@@ -64,30 +87,113 @@ export class GeocodingService {
 
       if (!res.ok) {
         this.logger.warn(`Nominatim HTTP ${res.status} for "${query}"`);
-        this.cache.set(key, null);
         return null;
       }
 
       const data = (await res.json()) as NominatimResult[];
       const hit = data[0];
-      if (!hit) {
-        this.cache.set(key, null);
-        return null;
-      }
+      if (!hit) return null;
 
-      const result: GeocodeHit = {
+      return {
         point: { lat: parseFloat(hit.lat), lng: parseFloat(hit.lon) },
         precision: this.classifyPrecision(hit),
         displayName: hit.display_name,
       };
-      this.cache.set(key, result);
-      return result;
     } catch (err) {
       this.logger.warn(
         `Nominatim failed for "${query}": ${(err as Error).message}`,
       );
       return null;
     }
+  }
+
+  /**
+   * Mapy.cz Geocoding API (api.mapy.cz/v1/geocode). Free tier: ~250k requests
+   * per month. Polish coverage is solid and the matcher is much more forgiving
+   * than Nominatim for inflected/abbreviated address forms. Used as fallback
+   * when Nominatim returns null or area-level only. No-op if MAPY_API_KEY
+   * is not set.
+   */
+  private async geocodeMapy(query: string): Promise<GeocodeHit | null> {
+    const apiKey = this.config.mapy.apiKey;
+    if (!apiKey) return null;
+
+    // Mapy.cz with type=regional.street works best with: bare street name +
+    // city only (no district, no "ul." prefix, no house number). Empirical:
+    // adding the house number drops the hit rate; the resulting street-level
+    // coordinate is plenty precise for our walking-distance filter.
+    const cleaned = query
+      .replace(/\b(ul\.?|ulica|al\.?|aleja|plac|pl\.?)\s+/gi, '')
+      // Drop the trailing ", <district/city>" token added by orchestrator.
+      .replace(/,\s*[^,]+$/i, '')
+      // Drop trailing house number ("Czarnomorska 17" → "Czarnomorska").
+      .replace(/\s+\d+[A-Za-z]?\s*$/i, '')
+      .trim();
+    const finalQuery = `${cleaned}, Warszawa`;
+
+    const url = new URL('https://api.mapy.cz/v1/geocode');
+    url.searchParams.set('query', finalQuery);
+    url.searchParams.set('lang', 'pl');
+    url.searchParams.set('limit', '1');
+    // Restrict to street-level matches — best precision for our use case.
+    url.searchParams.set('type', 'regional.street');
+
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'Accept-Language': 'pl',
+          'X-Mapy-Api-Key': apiKey,
+        },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) {
+        this.logger.warn(`Mapy.cz HTTP ${res.status} for "${finalQuery}"`);
+        return null;
+      }
+
+      const data = (await res.json()) as {
+        items?: Array<{
+          name?: string;
+          label?: string;
+          position?: { lat?: number; lon?: number };
+          type?: string;
+        }>;
+      };
+      const f = data.items?.[0];
+      const lat = f?.position?.lat;
+      const lon = f?.position?.lon;
+      if (!f || typeof lat !== 'number' || typeof lon !== 'number') return null;
+
+      const precision = this.classifyMapy(f.type ?? '');
+      const displayName = f.label ?? f.name ?? '';
+
+      this.logger.log(
+        `Mapy.cz: "${finalQuery}" → ${precision} (${displayName})`,
+      );
+
+      return {
+        point: { lat, lng: lon },
+        precision,
+        displayName,
+      };
+    } catch (err) {
+      this.logger.warn(`Mapy.cz failed for "${query}": ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Map Mapy.cz "type" string to our precision tiers. Their docs use values
+   * like "regional.address" (house+street), "regional.street", "regional.city",
+   * "poi", etc.
+   */
+  private classifyMapy(type: string): GeocodePrecision {
+    const t = type.toLowerCase();
+    if (t.includes('address')) return 'house';
+    if (t.includes('street')) return 'road';
+    if (t === 'poi' || t.includes('amenity') || t.includes('shop')) return 'place';
+    if (t.includes('city') || t.includes('district') || t.includes('suburb') || t.includes('region')) return 'area';
+    return 'unknown';
   }
 
   /**
