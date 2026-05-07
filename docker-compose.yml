@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rent-scraper-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rent}
+      POSTGRES_DB: ${POSTGRES_DB:-rent_scraper}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - rent-scraper-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rent} -d ${POSTGRES_DB:-rent_scraper}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot job: applies prisma migrations against the running db.
+  # Run manually:  docker compose run --rm prisma-migrate
+  prisma-migrate:
+    image: node:20-alpine
+    working_dir: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rent}:${POSTGRES_PASSWORD:-rent}@postgres:5432/${POSTGRES_DB:-rent_scraper}?schema=public
+    volumes:
+      - .:/app
+    command: sh -c "npx prisma migrate deploy && npx prisma generate"
+    profiles: ["tools"]
+
+volumes:
+  rent-scraper-data:

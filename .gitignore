@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+proxy.txt
+.DS_Store
+.idea/
+.vscode/
+coverage/
+*.tsbuildinfo
+
+# config files
+proxy.txt
+google.json

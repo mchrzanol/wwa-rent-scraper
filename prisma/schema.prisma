@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Portal {
+  OTODOM
+  OLX
+  GRATKA
+  MORIZON
+  NIERUCHOMOSCI_ONLINE
+  RENTOLA
+}
+
+enum ListingStatus {
+  PENDING_ENRICHMENT
+  PUBLISHED
+  REJECTED
+  STALE
+}
+
+model Listing {
+  id                  String        @id @default(cuid())
+  portal              Portal
+  externalId          String                                    // portal's listing id
+  url                 String        @unique
+
+  // Core data
+  title               String?
+  district            String
+  rooms               Int
+  areaM2              Float
+  rentPrice           Int                                       // base rent (PLN)
+  adminFee            Int?                                      // from listing or AI-extracted
+  deposit             Int?
+  totalPrice          Int                                       // rentPrice + (adminFee ?? 0)
+  phone               String?
+  postedAt            DateTime?
+
+  // Geo
+  latitude            Float
+  longitude           Float
+  nearestStation      String
+  haversineMeters     Int
+  walkingMeters       Int?                                      // ORS or OSRM, or haversine if both failed
+  walkingApproximate  Boolean       @default(false)             // true when walkingMeters falls back to straight-line
+
+  // Dedup fingerprint = sha1(roundedArea|totalPrice|district|roundedLatLng)
+  fingerprint         String        @db.VarChar(40)
+
+  status              ListingStatus @default(PENDING_ENRICHMENT)
+  rawDescription      String?       @db.Text
+  aiParsed            Json?
+
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  notifiedAt          DateTime?
+
+  duplicates          DuplicateLink[] @relation("primary")
+  duplicateOf         DuplicateLink[] @relation("duplicate")
+
+  @@unique([portal, externalId])
+  @@index([fingerprint])
+  @@index([district, totalPrice])
+  @@index([status, createdAt])
+}
+
+// Explicit dedup graph — keeps the canonical listing + every cross-portal duplicate
+model DuplicateLink {
+  id            String   @id @default(cuid())
+  primaryId     String
+  duplicateId   String
+  matchScore    Float                       // 0–1 similarity
+  reason        String                      // "exact_fingerprint" | "fuzzy_geo_price"
+  createdAt     DateTime @default(now())
+
+  primary       Listing  @relation("primary",   fields: [primaryId],   references: [id], onDelete: Cascade)
+  duplicate     Listing  @relation("duplicate", fields: [duplicateId], references: [id], onDelete: Cascade)
+
+  @@unique([primaryId, duplicateId])
+  @@index([duplicateId])
+}
+
+model ScrapeRun {
+  id           String   @id @default(cuid())
+  portal       Portal
+  startedAt    DateTime @default(now())
+  finishedAt   DateTime?
+  itemsFound   Int      @default(0)
+  itemsKept    Int      @default(0)
+  errors       Json?
+
+  @@index([portal, startedAt])
+}
