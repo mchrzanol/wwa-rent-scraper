@@ -11,7 +11,7 @@ export interface AppConfig {
   ors: { apiKey: string; baseUrl: string };
   openrouter: { apiKey: string; model: string };
   nominatim: { baseUrl: string; userAgent: string };
-  discord: { webhookUrl: string };
+  discord: { webhookUrl: string; statsWebhookUrl: string };
   sheets: { spreadsheetId: string; serviceAccountJson: string; sheetName: string };
   database: { url: string };
 }
@@ -43,7 +43,10 @@ export const loadConfig = (): AppConfig => ({
     userAgent:
       process.env.NOMINATIM_USER_AGENT ?? 'rent-scraper/1.0 (set NOMINATIM_USER_AGENT)',
   },
-  discord: { webhookUrl: process.env.DISCORD_WEBHOOK_URL ?? '' },
+  discord: {
+    webhookUrl: process.env.DISCORD_WEBHOOK_URL ?? '',
+    statsWebhookUrl: process.env.DISCORD_STATS_WEBHOOK_URL ?? '',
+  },
   sheets: {
     spreadsheetId: process.env.GOOGLE_SHEETS_ID ?? '',
     serviceAccountJson: process.env.GOOGLE_SA_JSON ?? '',

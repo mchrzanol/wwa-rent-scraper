@@ -46,9 +46,11 @@ export class ScrapeCron {
     }
     this.running = true;
     const startedAt = Date.now();
+    let report: import('../scrapers/scraper-orchestrator.service').OrchestratorReport | undefined;
+    let cycleError: Error | undefined;
 
     try {
-      const report = await this.orchestrator.runCycle({ maxPages });
+      report = await this.orchestrator.runCycle({ maxPages });
       this.logger.log(
         `Cycle outcomes — newListingIds=${report.newListingIds.length}, totals=${JSON.stringify(report.totals)}, rejectedByReason=${JSON.stringify(report.rejectedByReason)}`,
       );
@@ -61,8 +63,16 @@ export class ScrapeCron {
         this.logger.log('No new listings — skipping Sheets/Discord');
       }
     } catch (err) {
-      this.logger.error(`Cycle failed: ${(err as Error).message}`, (err as Error).stack);
+      cycleError = err as Error;
+      this.logger.error(`Cycle failed: ${cycleError.message}`, cycleError.stack);
     } finally {
+      // Stats webhook fires UNCONDITIONALLY — empty cycle, full cycle, or
+      // crashed cycle. The stats channel is the heartbeat.
+      try {
+        await this.discord.notifyCycleSummary(report, Date.now() - startedAt, cycleError);
+      } catch (err) {
+        this.logger.warn(`Stats notify failed: ${(err as Error).message}`);
+      }
       this.logger.log(`Cycle finished in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
       this.running = false;
     }

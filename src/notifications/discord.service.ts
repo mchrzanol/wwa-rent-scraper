@@ -3,6 +3,7 @@ import { Listing } from '@prisma/client';
 import { AppConfig } from '../config/configuration';
 import { APP_CONFIG } from '../playwright/playwright.service';
 import { PrismaService } from '../database/prisma.service';
+import type { OrchestratorReport } from '../scrapers/scraper-orchestrator.service';
 
 const PORTAL_COLORS: Record<string, number> = {
   OTODOM: 0x00a3a1,
@@ -129,6 +130,93 @@ export class DiscordService {
 
     if (!res.ok) {
       throw new Error(`Discord HTTP ${res.status}: ${await res.text()}`);
+    }
+  }
+
+  /**
+   * Posts an end-of-cycle stats summary to a separate informational webhook.
+   * Silent no-op if DISCORD_STATS_WEBHOOK_URL is not configured.
+   */
+  async notifyCycleSummary(
+    report: OrchestratorReport | undefined,
+    durationMs: number,
+    cycleError?: Error,
+  ): Promise<void> {
+    const url = this.config.discord.statsWebhookUrl;
+    if (!url) return;
+
+    const durationStr = `${(durationMs / 1000).toFixed(1)}s`;
+
+    let embed: Record<string, unknown>;
+    if (!report) {
+      embed = {
+        title: '💥 Scrape cycle crashed',
+        color: 0xed4245,
+        timestamp: new Date().toISOString(),
+        description: [
+          `Cycle aborted after ${durationStr} before producing a report.`,
+          '',
+          '```',
+          (cycleError?.message ?? 'unknown error').slice(0, 1500),
+          '```',
+        ].join('\n'),
+        footer: { text: 'No listings processed' },
+      };
+    } else {
+      const portalLines = Object.entries(report.perPortal).map(([portal, r]) => {
+        const reasons = Object.entries(r.rejectedByReason)
+          .sort(([, a], [, b]) => b - a)
+          .map(([reason, n]) => `${reason}=${n}`)
+          .join(', ');
+        const head = `**${portal}** — found ${r.found}, kept ${r.kept}, dup ${r.duplicates}, rejected ${r.rejected}` +
+          (r.errors ? `, errors ${r.errors}` : '');
+        return reasons ? `${head}\n  └ ${reasons}` : head;
+      });
+
+      const totalsLine =
+        `**Totals** — found ${report.totals.found}, kept ${report.totals.kept}, ` +
+        `duplicates ${report.totals.duplicates}, rejected ${report.totals.rejected} ` +
+        `(${durationStr})`;
+
+      const overallReasons = Object.entries(report.rejectedByReason)
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, 8)
+        .map(([reason, n]) => `\`${reason}\` — ${n}`)
+        .join('\n');
+
+      const errorLine = cycleError
+        ? `\n\n⚠️ Cycle reported an error: \`${cycleError.message.slice(0, 300)}\``
+        : '';
+
+      embed = {
+        title: cycleError
+          ? '⚠️ Scrape cycle finished with errors'
+          : '📊 Scrape cycle complete',
+        color: cycleError ? 0xfee75c : report.totals.kept > 0 ? 0x57f287 : 0x99aab5,
+        timestamp: new Date().toISOString(),
+        description: ([
+          totalsLine,
+          '',
+          ...portalLines,
+          ...(overallReasons ? ['', '**Top rejection reasons**', overallReasons] : []),
+        ]
+          .join('\n') + errorLine).slice(0, 4000),
+        footer: { text: `New listings: ${report.newListingIds.length}` },
+      };
+    }
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'rent-scraper-stats', embeds: [embed] }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) {
+        this.logger.warn(`Stats webhook HTTP ${res.status}: ${await res.text()}`);
+      }
+    } catch (err) {
+      this.logger.warn(`Stats webhook failed: ${(err as Error).message}`);
     }
   }
 }

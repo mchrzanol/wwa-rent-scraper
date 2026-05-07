@@ -16,9 +16,18 @@ import {
   PortalScraper,
 } from './portal-scraper.interface';
 
+export interface PortalReport {
+  found: number;
+  kept: number;
+  duplicates: number;
+  rejected: number;
+  errors: number;
+  rejectedByReason: Record<string, number>;
+}
+
 export interface OrchestratorReport {
   totals: { found: number; kept: number; duplicates: number; rejected: number };
-  perPortal: Record<string, { found: number; kept: number; errors: number }>;
+  perPortal: Record<string, PortalReport>;
   rejectedByReason: Record<string, number>;
   newListingIds: string[];
 }
@@ -70,7 +79,14 @@ export class ScraperOrchestratorService {
       const run = await this.prisma.scrapeRun.create({
         data: { portal: scraper.portal },
       });
-      const portalReport = { found: 0, kept: 0, errors: 0 };
+      const portalReport: PortalReport = {
+        found: 0,
+        kept: 0,
+        duplicates: 0,
+        rejected: 0,
+        errors: 0,
+        rejectedByReason: {},
+      };
       const errors: Array<{ url?: string; message: string }> = [];
 
       try {
@@ -94,9 +110,13 @@ export class ScraperOrchestratorService {
                 report.newListingIds.push(outcome.id);
                 break;
               case 'duplicate':
+                portalReport.duplicates += 1;
                 report.totals.duplicates += 1;
                 break;
               case 'rejected':
+                portalReport.rejected += 1;
+                portalReport.rejectedByReason[outcome.reason] =
+                  (portalReport.rejectedByReason[outcome.reason] ?? 0) + 1;
                 report.totals.rejected += 1;
                 report.rejectedByReason[outcome.reason] =
                   (report.rejectedByReason[outcome.reason] ?? 0) + 1;
@@ -135,6 +155,19 @@ export class ScraperOrchestratorService {
       `Cycle done — found ${report.totals.found}, kept ${report.totals.kept}, ` +
         `duplicates ${report.totals.duplicates}, rejected ${report.totals.rejected}`,
     );
+
+    this.logger.log('=== PER-PORTAL SUMMARY ===');
+    for (const [portal, r] of Object.entries(report.perPortal)) {
+      const reasonsStr = Object.entries(r.rejectedByReason)
+        .sort(([, a], [, b]) => b - a)
+        .map(([reason, n]) => `${reason}=${n}`)
+        .join(', ');
+      this.logger.log(
+        `[${portal}] found=${r.found} kept=${r.kept} duplicates=${r.duplicates} rejected=${r.rejected} errors=${r.errors}` +
+          (reasonsStr ? ` — reasons: ${reasonsStr}` : ''),
+      );
+    }
+    this.logger.log('==========================');
 
     if (rejectedDetails.length) {
       const grouped = new Map<string, Array<{ url: string; portal: string }>>();
