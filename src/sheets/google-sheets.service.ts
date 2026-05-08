@@ -96,6 +96,147 @@ export class GoogleSheetsService implements OnModuleInit {
   }
 
   /**
+   * Walks every row in the sheet, HEAD-checks each URL, and removes rows
+   * pointing to dead listings (404, 410, redirect away from the original URL).
+   * Listings are also flagged STALE in the DB so they don't get re-promoted.
+   *
+   * Returns the count of rows removed.
+   */
+  async cleanupDeadListings(): Promise<{ checked: number; removed: number }> {
+    if (!this.sheets) return { checked: 0, removed: 0 };
+
+    const sheetName = this.config.sheets.sheetName;
+    const meta = await this.sheets.spreadsheets.get({
+      spreadsheetId: this.config.sheets.spreadsheetId,
+    });
+    const sheetId = (meta.data.sheets ?? []).find(
+      (s) => s.properties?.title === sheetName,
+    )?.properties?.sheetId;
+    if (sheetId == null) return { checked: 0, removed: 0 };
+
+    // URL is column N (14th). Pull the entire column starting from row 2 to
+    // skip the header. Empty trailing rows are filtered by the API.
+    const resp = await this.sheets.spreadsheets.values.get({
+      spreadsheetId: this.config.sheets.spreadsheetId,
+      range: `${sheetName}!N2:N`,
+    });
+    const urls = (resp.data.values ?? []).map((row) => (row[0] as string) ?? '');
+    if (!urls.length) return { checked: 0, removed: 0 };
+
+    const deadIndices: number[] = [];
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i].trim();
+      if (!url) continue;
+      const dead = await this.isListingDead(url);
+      if (dead) deadIndices.push(i);
+      // Pace requests so portals don't rate-limit / block us.
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    if (deadIndices.length === 0) {
+      this.logger.log(`Cleanup: ${urls.length} listings checked, all alive`);
+      return { checked: urls.length, removed: 0 };
+    }
+
+    // Mark dead URLs as STALE in the DB.
+    const deadUrls = deadIndices.map((i) => urls[i]);
+    try {
+      const updated = await this.prisma.listing.updateMany({
+        where: { url: { in: deadUrls } },
+        data: { status: 'STALE' },
+      });
+      this.logger.log(`Cleanup: marked ${updated.count} listing(s) as STALE in DB`);
+    } catch (err) {
+      this.logger.warn(`Cleanup DB update failed: ${(err as Error).message}`);
+    }
+
+    // Delete rows bottom-up so earlier indices stay valid. Sheet rows are
+    // 0-indexed; the URL column starts at row 2 (index 1) because of the header.
+    const sortedDesc = [...deadIndices].sort((a, b) => b - a);
+    const requests = sortedDesc.map((i) => ({
+      deleteDimension: {
+        range: {
+          sheetId,
+          dimension: 'ROWS' as const,
+          startIndex: i + 1, // +1 for header row
+          endIndex: i + 2,
+        },
+      },
+    }));
+    await this.sheets.spreadsheets.batchUpdate({
+      spreadsheetId: this.config.sheets.spreadsheetId,
+      requestBody: { requests },
+    });
+
+    this.logger.log(
+      `Cleanup: ${urls.length} listings checked, ${deadIndices.length} removed`,
+    );
+    return { checked: urls.length, removed: deadIndices.length };
+  }
+
+  /**
+   * Single URL liveness check. We treat as dead:
+   *   - HTTP 404, 410, 451
+   *   - HTTP 5xx persistently (one shot — don't false-positive on transient)
+   *   - 2xx but final URL no longer points at a listing detail page
+   *     (portals redirect expired ads to the search/home page).
+   * On network errors we KEEP the listing — better a stale row than mass
+   * deletion if the network blips.
+   */
+  private async isListingDead(url: string): Promise<boolean> {
+    try {
+      const res = await fetch(url, {
+        method: 'HEAD',
+        redirect: 'follow',
+        signal: AbortSignal.timeout(8_000),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (rent-scraper liveness check)',
+          Accept: 'text/html',
+        },
+      });
+
+      if (res.status === 404 || res.status === 410 || res.status === 451) {
+        return true;
+      }
+
+      // Some portals reject HEAD; retry GET if status is 405 / 403.
+      if (res.status === 405 || res.status === 403) {
+        const get = await fetch(url, {
+          method: 'GET',
+          redirect: 'follow',
+          signal: AbortSignal.timeout(8_000),
+          headers: { 'User-Agent': 'Mozilla/5.0 (rent-scraper liveness check)' },
+        });
+        if (get.status === 404 || get.status === 410 || get.status === 451) return true;
+        if (this.isRedirectedAway(url, get.url)) return true;
+        return false;
+      }
+
+      if (this.isRedirectedAway(url, res.url)) return true;
+
+      return false;
+    } catch (err) {
+      // Network/timeout errors → keep, don't risk false-positives.
+      this.logger.warn(`Liveness check failed for ${url}: ${(err as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Heuristic: a redirect is considered "away" when the final URL no longer
+   * contains the original ad's slug or ID. Listing URLs typically have a
+   * portal-specific ID; if that's gone, the ad is dead.
+   */
+  private isRedirectedAway(originalUrl: string, finalUrl: string): boolean {
+    if (!finalUrl || originalUrl === finalUrl) return false;
+    // Compare path heads. If the original had `/oferta/`, `/d/oferta/` or
+    // `/do-wynajecia/` and final no longer does → away.
+    const origIsListing = /\/(?:oferta|d\/oferta|do-wynajecia)\//.test(originalUrl);
+    const finalIsListing = /\/(?:oferta|d\/oferta|do-wynajecia)\//.test(finalUrl);
+    return origIsListing && !finalIsListing;
+  }
+
+  /**
    * Accepts either an inline JSON blob or a filesystem path to a service-account
    * JSON file. Path is detected when the value does not start with `{`.
    * Relative paths are resolved against process.cwd().
