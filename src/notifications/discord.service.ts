@@ -51,7 +51,10 @@ export class DiscordService {
           `Discord push failed for ${listing.url}: ${(err as Error).message}`,
         );
       }
-      await new Promise((r) => setTimeout(r, 500));
+      // ~750ms between posts is comfortably under the 5 req / 2s webhook
+      // limit. The bursty channel-specific rate-limit is handled per-call
+      // by retry-on-429 inside postEmbed.
+      await new Promise((r) => setTimeout(r, 750));
     }
   }
 
@@ -121,14 +124,55 @@ export class DiscordService {
       } m → ${listing.nearestStation}`,
     };
 
-    const res = await fetch(this.config.discord.webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(10_000),
-    });
+    await this.postWithRetry(this.config.discord.webhookUrl, body);
+  }
 
-    if (!res.ok) {
+  /**
+   * POST a webhook payload, honouring Discord's 429 rate-limit response. On
+   * 429 we sleep for `retry_after` (Discord tells us exactly how long to wait)
+   * and retry up to MAX_RETRIES times. Non-429 errors bubble up unchanged.
+   */
+  private async postWithRetry(
+    webhookUrl: string,
+    body: unknown,
+    maxRetries = 3,
+  ): Promise<void> {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const res = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.ok) return;
+
+      if (res.status === 429) {
+        const text = await res.text();
+        // Discord returns either a JSON {retry_after: <seconds>} body or a
+        // Retry-After header (older API). Prefer the body, fall back to header.
+        let retryAfterMs = 1000;
+        try {
+          const parsed = JSON.parse(text) as { retry_after?: number };
+          if (typeof parsed.retry_after === 'number') {
+            retryAfterMs = Math.ceil(parsed.retry_after * 1000);
+          }
+        } catch {
+          const header = res.headers.get('retry-after');
+          if (header) retryAfterMs = Math.ceil(parseFloat(header) * 1000);
+        }
+        // Add a small jitter so we don't all wake up at the exact same moment.
+        retryAfterMs = Math.min(retryAfterMs + 100, 30_000);
+
+        if (attempt === maxRetries) {
+          throw new Error(`Discord HTTP 429 after ${maxRetries} retries: ${text}`);
+        }
+        this.logger.warn(
+          `Discord 429 — sleeping ${retryAfterMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+        );
+        await new Promise((r) => setTimeout(r, retryAfterMs));
+        continue;
+      }
+
       throw new Error(`Discord HTTP ${res.status}: ${await res.text()}`);
     }
   }
@@ -206,15 +250,7 @@ export class DiscordService {
     }
 
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'rent-scraper-stats', embeds: [embed] }),
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!res.ok) {
-        this.logger.warn(`Stats webhook HTTP ${res.status}: ${await res.text()}`);
-      }
+      await this.postWithRetry(url, { username: 'rent-scraper-stats', embeds: [embed] });
     } catch (err) {
       this.logger.warn(`Stats webhook failed: ${(err as Error).message}`);
     }

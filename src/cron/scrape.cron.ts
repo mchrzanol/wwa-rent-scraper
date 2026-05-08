@@ -36,6 +36,32 @@ export class ScrapeCron {
   }
 
   /**
+   * Hourly :30 between 06–22 — checks every URL in the Sheet and removes
+   * rows for listings that have gone 404/410/redirected-away. Marks the
+   * matching DB rows as STALE so they don't re-surface.
+   *
+   * Reuses `this.running` as a mutex: if a scrape is in progress we skip,
+   * and while cleanup runs scrapes will skip too. Cleanup vs append racing
+   * for the same Sheet would otherwise cause row-index corruption.
+   */
+  @Cron('30 6-22 * * *', { timeZone: 'Europe/Warsaw' })
+  async cleanup(): Promise<void> {
+    if (this.running) {
+      this.logger.warn('Cleanup skipped — another job (scrape/cleanup) in progress');
+      return;
+    }
+    this.running = true;
+    try {
+      const { checked, removed } = await this.sheets.cleanupDeadListings();
+      this.logger.log(`Cleanup tick: checked=${checked}, removed=${removed}`);
+    } catch (err) {
+      this.logger.error(`Cleanup failed: ${(err as Error).message}`);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /**
    * Single-flight guard prevents overlap if a cycle ever runs longer than an
    * hour (deep scans on slow proxies often will).
    */
