@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service';
 import { ScrapeCron } from '../cron/scrape.cron';
+import { GoogleSheetsService } from '../sheets/google-sheets.service';
 
 @Controller('test')
 export class HealthController {
@@ -17,6 +18,7 @@ export class HealthController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly scrapeCron: ScrapeCron,
+    private readonly sheets: GoogleSheetsService,
   ) {}
 
   @Get()
@@ -64,5 +66,15 @@ export class HealthController {
       this.logger.error(`Manual cycle failed: ${(err as Error).message}`);
     });
     return { triggered: true, alreadyRunning: false, maxPages };
+  }
+
+  /**
+   * Wipes the sheet's data rows and re-emits every Listing in the DB with
+   * the current row schema. Use after changing the row shape or to recover
+   * a desynced sheet. Manual Status edits in the sheet are lost.
+   */
+  @Post('sheets/resync')
+  async resyncSheet(): Promise<{ written: number }> {
+    return this.sheets.resyncAllListings();
   }
 }

@@ -27,7 +27,37 @@ const HEADER = [
   'Nearest station',
   'Phone',
   'URL',
-];
+  'Score',
+  'Status',
+] as const;
+
+const STATUS_VALUES = ['new', 'shortlist', 'contacted', 'viewed', 'rejected'] as const;
+const STATUS_DEFAULT: typeof STATUS_VALUES[number] = 'new';
+
+const STATUS_COLORS: Record<string, { red: number; green: number; blue: number }> = {
+  shortlist: { red: 1.0, green: 0.95, blue: 0.7 },   // light yellow
+  contacted: { red: 0.78, green: 0.87, blue: 0.97 }, // light blue
+  viewed:    { red: 0.86, green: 0.82, blue: 0.94 }, // light purple
+  rejected:  { red: 0.96, green: 0.80, blue: 0.80 }, // light red
+};
+
+const COL = {
+  Score: HEADER.indexOf('Score'),
+  Status: HEADER.indexOf('Status'),
+} as const;
+
+const RANGE_A_TO_LAST = `A:${columnLetter(HEADER.length)}`;
+
+function columnLetter(n: number): string {
+  // 1-indexed: 1→A, 26→Z, 27→AA. HEADER.length is 16 → 'P'.
+  let s = '';
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
 
 @Injectable()
 export class GoogleSheetsService implements OnModuleInit {
@@ -62,6 +92,7 @@ export class GoogleSheetsService implements OnModuleInit {
     this.sheets = google.sheets({ version: 'v4', auth: await auth.getClient() as any });
 
     await this.ensureHeader();
+    await this.applySheetFormatting();
   }
 
   /**
@@ -74,7 +105,6 @@ export class GoogleSheetsService implements OnModuleInit {
     const listings = await this.prisma.listing.findMany({
       where: { id: { in: listingIds } },
     });
-    // Preserve caller's order
     const byId = new Map(listings.map((l) => [l.id, l]));
     const ordered = listingIds.map((id) => byId.get(id)).filter(Boolean) as Listing[];
     if (!ordered.length) return;
@@ -84,7 +114,7 @@ export class GoogleSheetsService implements OnModuleInit {
     try {
       await this.sheets.spreadsheets.values.append({
         spreadsheetId: this.config.sheets.spreadsheetId,
-        range: `${this.config.sheets.sheetName}!A:N`,
+        range: `${this.config.sheets.sheetName}!${RANGE_A_TO_LAST}`,
         valueInputOption: 'USER_ENTERED',
         insertDataOption: 'INSERT_ROWS',
         requestBody: { values },
@@ -237,16 +267,64 @@ export class GoogleSheetsService implements OnModuleInit {
   }
 
   /**
-   * Accepts either an inline JSON blob or a filesystem path to a service-account
-   * JSON file. Path is detected when the value does not start with `{`.
-   * Relative paths are resolved against process.cwd().
+   * Wipes all data rows (keeping header + tab) and re-emits every Listing in
+   * the DB with the current schema (Score/Status etc.). Use after the row
+   * shape changes or when you want the sheet rebuilt from scratch.
+   *
+   * Caveat: this clobbers any manual Status edits in the sheet — Status is
+   * sheet-only state, not persisted to DB.
    */
+  async resyncAllListings(): Promise<{ written: number }> {
+    if (!this.sheets) {
+      throw new Error('Sheets not configured');
+    }
+
+    const all = await this.prisma.listing.findMany({
+      orderBy: { createdAt: 'desc' },
+    });
+    this.logger.warn(
+      `Resync: wiping sheet "${this.config.sheets.sheetName}" and writing ${all.length} rows from DB. ` +
+        `Any manual Status edits in the sheet will be lost.`,
+    );
+
+    // Clear data rows (everything below header).
+    await this.sheets.spreadsheets.values.clear({
+      spreadsheetId: this.config.sheets.spreadsheetId,
+      range: `${this.config.sheets.sheetName}!${columnLetter(1)}2:${columnLetter(HEADER.length)}`,
+    });
+
+    if (all.length) {
+      const values = all.map((l) => this.toRow(l));
+      await this.sheets.spreadsheets.values.update({
+        spreadsheetId: this.config.sheets.spreadsheetId,
+        range: `${this.config.sheets.sheetName}!A2`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values },
+      });
+    }
+
+    // Re-apply formatting (filter range, validation, conditional rules).
+    await this.applySheetFormatting();
+    this.logger.log(`Resync done: ${all.length} rows written`);
+    return { written: all.length };
+  }
+
   private loadServiceAccount(value: string): Record<string, unknown> {
     const trimmed = value.trim();
     const raw = trimmed.startsWith('{')
       ? trimmed
       : readFileSync(isAbsolute(trimmed) ? trimmed : resolve(process.cwd(), trimmed), 'utf8');
     return JSON.parse(raw);
+  }
+
+  /**
+   * Score: higher = better deal. Combines price-per-m² and walking distance
+   * (both lower-is-better). Tunable formula — tweak as priorities shift.
+   */
+  private computeScore(l: Listing): number {
+    const pricePerM2 = l.totalPrice / l.areaM2;
+    const walk = l.walkingMeters ?? l.haversineMeters;
+    return Math.round(200 - pricePerM2 - walk / 100);
   }
 
   private toRow(l: Listing): Array<string | number | boolean> {
@@ -265,12 +343,15 @@ export class GoogleSheetsService implements OnModuleInit {
       l.nearestStation,
       l.phone ?? '',
       l.url,
+      this.computeScore(l),
+      STATUS_DEFAULT,
     ];
   }
 
   /**
-   * Idempotent: ensures a tab named this.config.sheets.sheetName exists (creates if missing) and
-   * writes the header row only if A1 is empty.
+   * Idempotent: ensures the tab exists, writes the header row if missing, and
+   * upgrades an outdated header in-place (so callers don't have to wipe the
+   * sheet when columns are added).
    */
   private async ensureHeader(): Promise<void> {
     if (!this.sheets) return;
@@ -294,85 +375,180 @@ export class GoogleSheetsService implements OnModuleInit {
 
       const probe = await this.sheets.spreadsheets.values.get({
         spreadsheetId: this.config.sheets.spreadsheetId,
-        range: `${this.config.sheets.sheetName}!A1`,
+        range: `${this.config.sheets.sheetName}!1:1`,
       });
-      if (probe.data.values?.[0]?.[0]) return;
+      const currentHeader = (probe.data.values?.[0] ?? []) as string[];
+      const matches =
+        currentHeader.length === HEADER.length &&
+        HEADER.every((h, i) => currentHeader[i] === h);
 
-      await this.sheets.spreadsheets.values.update({
-        spreadsheetId: this.config.sheets.spreadsheetId,
-        range: `${this.config.sheets.sheetName}!A1`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [HEADER] },
-      });
-      this.logger.log('Wrote Sheets header row');
-
-      await this.applyHeaderFormatting();
+      if (!matches) {
+        await this.sheets.spreadsheets.values.update({
+          spreadsheetId: this.config.sheets.spreadsheetId,
+          range: `${this.config.sheets.sheetName}!A1:${columnLetter(HEADER.length)}1`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [[...HEADER]] },
+        });
+        this.logger.log(
+          currentHeader.length
+            ? `Upgraded Sheets header (was ${currentHeader.length} cols, now ${HEADER.length})`
+            : 'Wrote Sheets header row',
+        );
+      }
     } catch (err) {
       this.logger.warn(`ensureHeader skipped: ${(err as Error).message}`);
     }
   }
 
   /**
-   * Bolds the header row, freezes it, applies a banded background, and adds
-   * a basic filter — turns the raw values into a real "table" view.
+   * Idempotent: header bold/freeze/filter, Status dropdown, conditional
+   * formatting per Status value. Safe to re-run on every boot.
    */
-  private async applyHeaderFormatting(): Promise<void> {
+  private async applySheetFormatting(): Promise<void> {
     if (!this.sheets) return;
-    const meta = await this.sheets.spreadsheets.get({
-      spreadsheetId: this.config.sheets.spreadsheetId,
-    });
-    const sheetId = (meta.data.sheets ?? []).find(
-      (s) => s.properties?.title === this.config.sheets.sheetName,
-    )?.properties?.sheetId;
-    if (sheetId == null) return;
+    try {
+      const meta = await this.sheets.spreadsheets.get({
+        spreadsheetId: this.config.sheets.spreadsheetId,
+      });
+      const sheet = (meta.data.sheets ?? []).find(
+        (s) => s.properties?.title === this.config.sheets.sheetName,
+      );
+      const sheetId = sheet?.properties?.sheetId;
+      if (sheetId == null) return;
 
-    await this.sheets.spreadsheets.batchUpdate({
-      spreadsheetId: this.config.sheets.spreadsheetId,
-      requestBody: {
-        requests: [
-          // Freeze header row
-          {
-            updateSheetProperties: {
-              properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
-              fields: 'gridProperties.frozenRowCount',
-            },
+      const requests: sheets_v4.Schema$Request[] = [
+        {
+          updateSheetProperties: {
+            properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
+            fields: 'gridProperties.frozenRowCount',
           },
-          // Bold + grey background on header
-          {
-            repeatCell: {
-              range: { sheetId, startRowIndex: 0, endRowIndex: 1 },
-              cell: {
-                userEnteredFormat: {
-                  textFormat: { bold: true },
-                  backgroundColor: { red: 0.92, green: 0.92, blue: 0.95 },
-                  horizontalAlignment: 'CENTER',
-                },
-              },
-              fields: 'userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)',
-            },
-          },
-          // Auto-filter over all columns
-          {
-            setBasicFilter: {
-              filter: {
-                range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: HEADER.length },
+        },
+        {
+          repeatCell: {
+            range: { sheetId, startRowIndex: 0, endRowIndex: 1 },
+            cell: {
+              userEnteredFormat: {
+                textFormat: { bold: true },
+                backgroundColor: { red: 0.92, green: 0.92, blue: 0.95 },
+                horizontalAlignment: 'CENTER',
               },
             },
+            fields: 'userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)',
           },
-          // Auto-resize all columns to fit
-          {
-            autoResizeDimensions: {
-              dimensions: {
+        },
+        {
+          setBasicFilter: {
+            filter: {
+              range: {
                 sheetId,
-                dimension: 'COLUMNS',
-                startIndex: 0,
-                endIndex: HEADER.length,
+                startRowIndex: 0,
+                startColumnIndex: 0,
+                endColumnIndex: HEADER.length,
               },
             },
           },
-        ],
-      },
-    });
-    this.logger.log('Applied Sheets header formatting (frozen, bold, filtered)');
+        },
+        {
+          autoResizeDimensions: {
+            dimensions: {
+              sheetId,
+              dimension: 'COLUMNS',
+              startIndex: 0,
+              endIndex: HEADER.length,
+            },
+          },
+        },
+        // Data validation dropdown on Status column (rows 2..end).
+        {
+          setDataValidation: {
+            range: {
+              sheetId,
+              startRowIndex: 1,
+              startColumnIndex: COL.Status,
+              endColumnIndex: COL.Status + 1,
+            },
+            rule: {
+              condition: {
+                type: 'ONE_OF_LIST',
+                values: STATUS_VALUES.map((v) => ({ userEnteredValue: v })),
+              },
+              showCustomUi: true,
+              strict: false,
+            },
+          },
+        },
+      ];
+
+      // Conditional formatting per status value (skip 'new' = no color).
+      for (const status of STATUS_VALUES) {
+        if (status === 'new') continue;
+        requests.push({
+          addConditionalFormatRule: {
+            rule: {
+              ranges: [
+                {
+                  sheetId,
+                  startRowIndex: 1,
+                  startColumnIndex: 0,
+                  endColumnIndex: HEADER.length,
+                },
+              ],
+              booleanRule: {
+                condition: {
+                  type: 'CUSTOM_FORMULA',
+                  values: [
+                    {
+                      userEnteredValue: `=$${columnLetter(COL.Status + 1)}2="${status}"`,
+                    },
+                  ],
+                },
+                format: { backgroundColor: STATUS_COLORS[status] },
+              },
+            },
+            index: 0,
+          },
+        });
+      }
+
+      // Conditional gradient on Score column: red (low) → green (high).
+      requests.push({
+        addConditionalFormatRule: {
+          rule: {
+            ranges: [
+              {
+                sheetId,
+                startRowIndex: 1,
+                startColumnIndex: COL.Score,
+                endColumnIndex: COL.Score + 1,
+              },
+            ],
+            gradientRule: {
+              minpoint: {
+                type: 'MIN',
+                color: { red: 0.96, green: 0.80, blue: 0.80 },
+              },
+              midpoint: {
+                type: 'PERCENTILE',
+                value: '50',
+                color: { red: 1, green: 1, blue: 0.85 },
+              },
+              maxpoint: {
+                type: 'MAX',
+                color: { red: 0.72, green: 0.88, blue: 0.74 },
+              },
+            },
+          },
+          index: 0,
+        },
+      });
+
+      await this.sheets.spreadsheets.batchUpdate({
+        spreadsheetId: this.config.sheets.spreadsheetId,
+        requestBody: { requests },
+      });
+      this.logger.log('Applied Sheets formatting (header, validation, conditional rules)');
+    } catch (err) {
+      this.logger.warn(`applySheetFormatting skipped: ${(err as Error).message}`);
+    }
   }
 }
