@@ -1,4 +1,4 @@
-import { Portal } from '@prisma/client';
+import { ParkingType, Portal } from '@prisma/client';
 
 /**
  * What a portal scraper produces. Coordinates may be missing — the
@@ -17,6 +17,9 @@ export interface RawListing {
   rentPrice: number;
   adminFee?: number;
   deposit?: number;
+  parking?: ParkingType;
+  /** PLN/month. 0 means included in rent/admin. undefined means unknown. */
+  parkingFee?: number;
 
   latitude?: number;
   longitude?: number;

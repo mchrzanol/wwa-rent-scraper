@@ -23,6 +23,11 @@ enum ListingStatus {
   STALE
 }
 
+enum ParkingType {
+  PARKING
+  GARAGE
+}
+
 model Listing {
   id                  String        @id @default(cuid())
   portal              Portal
@@ -38,6 +43,8 @@ model Listing {
   adminFee            Int?                                      // from listing or AI-extracted
   deposit             Int?
   totalPrice          Int                                       // rentPrice + (adminFee ?? 0)
+  parking             ParkingType?                              // PARKING / GARAGE / null (none mentioned)
+  parkingFee          Int?                                      // PLN/month; 0 = included in rent/admin; null = unknown
   phone               String?
   postedAt            DateTime?
 

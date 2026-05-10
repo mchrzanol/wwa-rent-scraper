@@ -216,17 +216,21 @@ export class ScraperOrchestratorService {
       return { kind: 'rejected', reason: 'rooms_mismatch' };
     }
 
-    // 2. Resolve adminFee + deposit + totalPrice (AI fallback when missing)
+    // 2. Resolve adminFee + deposit + parking + totalPrice (AI fallback when missing)
     let adminFee = raw.adminFee;
     let deposit = raw.deposit;
+    let parking = raw.parking;
+    let parkingFee = raw.parkingFee;
     let aiParsed: unknown;
-    if ((adminFee == null || deposit == null) && raw.rawDescription) {
-      this.logger.log(`  ↳ adminFee/deposit missing → calling AI cost extractor`);
+    if ((adminFee == null || deposit == null || parking == null) && raw.rawDescription) {
+      this.logger.log(`  ↳ adminFee/deposit/parking missing → calling AI cost extractor`);
       const costs = await this.ai.resolveCosts(raw.rawDescription);
       adminFee = adminFee ?? costs.adminFee;
       deposit = deposit ?? costs.deposit;
+      parking = parking ?? costs.parking;
+      parkingFee = parkingFee ?? costs.parkingFee;
       aiParsed = costs;
-      this.logger.log(`  ↳ AI returned adminFee=${adminFee ?? 'null'}, deposit=${deposit ?? 'null'} (confidence=${costs.confidence})`);
+      this.logger.log(`  ↳ AI returned adminFee=${adminFee ?? 'null'}, deposit=${deposit ?? 'null'}, parking=${parking ?? 'null'} (fee=${parkingFee ?? 'null'}, confidence=${costs.confidence})`);
     }
     const totalPrice = raw.rentPrice + (adminFee ?? 0);
     if (totalPrice > this.config.filters.maxTotalPrice) {
@@ -283,6 +287,8 @@ export class ScraperOrchestratorService {
       totalPrice,
       adminFee,
       deposit,
+      parking,
+      parkingFee,
       nearestStation: distance.station.name,
       haversineMeters: distance.haversineMeters,
       walkingMeters: distance.walkingMeters,
@@ -427,6 +433,8 @@ export class ScraperOrchestratorService {
       rentPrice: n.rentPrice,
       adminFee: n.adminFee,
       deposit: n.deposit,
+      parking: n.parking,
+      parkingFee: n.parkingFee,
       totalPrice: n.totalPrice,
       phone: n.phone,
       postedAt: n.postedAt,

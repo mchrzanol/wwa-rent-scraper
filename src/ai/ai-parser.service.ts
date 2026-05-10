@@ -8,11 +8,17 @@ interface AggregatedResult {
   address: ExtractedAddress | null;
 }
 
+export type ParkingKind = 'PARKING' | 'GARAGE';
+
 export interface ParsedCosts {
   rentPrice?: number;       // base rent stated in description (PLN)
   adminFee?: number;        // "czynsz administracyjny" / building fee (PLN)
   utilities?: number;       // media estimate if separately listed (PLN)
   deposit?: number;         // kaucja (PLN)
+  /** Parking kind mentioned in the description, if any. */
+  parking?: ParkingKind;
+  /** PLN/month. 0 = included in rent/admin. undefined = not mentioned. */
+  parkingFee?: number;
   /** 0..1 — model's confidence that adminFee is real, not implied. */
   confidence: number;
   notes?: string;
@@ -134,7 +140,52 @@ export class AiParserService {
     const depositMatch = norm.match(/kaucja[^0-9]{0,15}(\d{3,5})\s*(?:zł|pln)/i);
     if (depositMatch) out.deposit = Number.parseInt(depositMatch[1], 10);
 
+    const parking = this.regexExtractParking(norm);
+    if (parking) {
+      out.parking = parking.kind;
+      out.parkingFee = parking.fee;
+    }
+
     return out;
+  }
+
+  /**
+   * Detects parking/garage mention and (best-effort) monthly fee.
+   *   - garage takes priority over open parking when both mentioned
+   *   - "w cenie" / "wliczone" / "gratis" → fee = 0
+   *   - "X zł / mies" near the parking word → fee = X
+   *   - mention without price info → fee = undefined (unknown)
+   */
+  regexExtractParking(text: string): { kind: ParkingKind; fee?: number } | null {
+    const garageRe = /\bgara[żz](?:em|u|y|ami|ach)?\b/i;
+    const parkingRe = /\b(?:miejsc[ea]?\s+(?:postojow[eya]|parkingow[eya])|miejsce\s+w\s+hali|parking(?:owe|owy|owa|u|iem)?)\b/i;
+
+    const hasGarage = garageRe.test(text);
+    const hasParking = parkingRe.test(text);
+    if (!hasGarage && !hasParking) return null;
+
+    const kind: ParkingKind = hasGarage ? 'GARAGE' : 'PARKING';
+
+    // Find an anchor index for the matched word so we can scan a small window
+    // around it for a price or "in price" phrase.
+    const anchor = (hasGarage ? text.match(garageRe) : text.match(parkingRe))!;
+    const idx = anchor.index ?? 0;
+    const start = Math.max(0, idx - 60);
+    const end = Math.min(text.length, idx + (anchor[0].length) + 80);
+    const window = text.slice(start, end);
+
+    if (/\b(?:w\s+cenie|wliczon[ye]|gratis|bezpłatn[ye]|w\s+czynszu)\b/i.test(window)) {
+      return { kind, fee: 0 };
+    }
+
+    const priceMatch = window.match(/(\d{2,4})\s*(?:zł|pln)\s*(?:\/\s*(?:mies|m-c|miesi[ąa]c)|miesi[ęe]cznie)?/i);
+    if (priceMatch) {
+      const fee = Number.parseInt(priceMatch[1], 10);
+      // Sanity: parking fees are typically 100–800 PLN.
+      if (fee >= 30 && fee <= 2000) return { kind, fee };
+    }
+
+    return { kind };
   }
 
   /**
@@ -263,6 +314,8 @@ SCHEMA:
   "adminFee": int|null,
   "utilities": int|null,
   "deposit": int|null,
+  "parking": "PARKING"|"GARAGE"|null,
+  "parkingFee": int|null,
   "costsConfidence": 0..1,
   "costsNotes": string|null,
   "street": string|null,
@@ -282,6 +335,17 @@ TASK A — COSTS
 - rentPrice / utilities are optional best-effort.
 - Use null for unknown values.
 - costsConfidence reflects how explicit the adminFee figure is in the text.
+
+PARKING:
+- parking = "GARAGE" if the text mentions "garaż", "miejsce w garażu", "garaż podziemny".
+- parking = "PARKING" if it mentions "miejsce postojowe", "miejsce parkingowe",
+  "miejsce w hali", "parking" but not a garage.
+- If both are mentioned, prefer "GARAGE".
+- If parking/garage is not mentioned at all → parking = null, parkingFee = null.
+- parkingFee = monthly cost in PLN.
+    * 0 if "w cenie", "wliczone", "gratis", "bezpłatnie", "w czynszu".
+    * integer if a price is given near the word ("garaż 300 zł/mc").
+    * null if mentioned without any pricing info.
 
 ================================================================
 TASK B — ADDRESS / LOCATION ANCHOR
@@ -315,16 +379,16 @@ ADDRESS CONFIDENCE SCALE
 EXAMPLES
 ================================================================
 INPUT: "Wynajmę mieszkanie. Dokładny adres Stańczyka 5, 3 piętro. Czynsz administracyjny 800 zł, kaucja 4000 zł."
-OUTPUT: {"rentPrice":null,"adminFee":800,"utilities":null,"deposit":4000,"costsConfidence":0.9,"costsNotes":null,"street":"Stańczyka","number":"5","landmark":null,"addressConfidence":0.95}
+OUTPUT: {"rentPrice":null,"adminFee":800,"utilities":null,"deposit":4000,"parking":null,"parkingFee":null,"costsConfidence":0.9,"costsNotes":null,"street":"Stańczyka","number":"5","landmark":null,"addressConfidence":0.95}
 
-INPUT: "Mieszkanie przy ul. Kolejowej 19/4. Najem 3500 zł + 700 zł czynsz."
-OUTPUT: {"rentPrice":3500,"adminFee":700,"utilities":null,"deposit":null,"costsConfidence":0.8,"costsNotes":null,"street":"Kolejowa","number":"19","landmark":null,"addressConfidence":0.95}
+INPUT: "Mieszkanie przy ul. Kolejowej 19/4. Najem 3500 zł + 700 zł czynsz. Miejsce postojowe w hali 250 zł/mc."
+OUTPUT: {"rentPrice":3500,"adminFee":700,"utilities":null,"deposit":null,"parking":"PARKING","parkingFee":250,"costsConfidence":0.8,"costsNotes":null,"street":"Kolejowa","number":"19","landmark":null,"addressConfidence":0.95}
 
-INPUT: "Apartament w kompleksie Mennica Residence na Mokotowie. 7000 zł + media."
-OUTPUT: {"rentPrice":7000,"adminFee":null,"utilities":null,"deposit":null,"costsConfidence":0.3,"costsNotes":"media wg zużycia","street":null,"number":null,"landmark":"Mennica Residence","addressConfidence":0.75}
+INPUT: "Apartament w kompleksie Mennica Residence na Mokotowie. 7000 zł + media. Garaż w cenie."
+OUTPUT: {"rentPrice":7000,"adminFee":null,"utilities":null,"deposit":null,"parking":"GARAGE","parkingFee":0,"costsConfidence":0.3,"costsNotes":"media wg zużycia","street":null,"number":null,"landmark":"Mennica Residence","addressConfidence":0.75}
 
 INPUT: "Mieszkanie w Starym Mokotowie. Świetna lokalizacja. 4500 zł czynsz."
-OUTPUT: {"rentPrice":4500,"adminFee":null,"utilities":null,"deposit":null,"costsConfidence":0.0,"costsNotes":null,"street":null,"number":null,"landmark":null,"addressConfidence":0.0}
+OUTPUT: {"rentPrice":4500,"adminFee":null,"utilities":null,"deposit":null,"parking":null,"parkingFee":null,"costsConfidence":0.0,"costsNotes":null,"street":null,"number":null,"landmark":null,"addressConfidence":0.0}
 
 REMEMBER: JSON ONLY. No \`\`\`. No prose. No trailing whitespace.`;
 
@@ -497,6 +561,8 @@ REMEMBER: JSON ONLY. No \`\`\`. No prose. No trailing whitespace.`;
           ...ai.costs,
           adminFee: ai.costs.adminFee ?? regexCosts.adminFee,
           deposit: ai.costs.deposit ?? regexCosts.deposit,
+          parking: ai.costs.parking ?? regexCosts.parking,
+          parkingFee: ai.costs.parkingFee ?? regexCosts.parkingFee,
         }
       : regexCosts;
 
@@ -577,6 +643,8 @@ REMEMBER: JSON ONLY. No \`\`\`. No prose. No trailing whitespace.`;
       adminFee?: number | null;
       utilities?: number | null;
       deposit?: number | null;
+      parking?: string | null;
+      parkingFee?: number | null;
       costsConfidence?: number;
       costsNotes?: string | null;
       street?: string | null;
@@ -590,11 +658,23 @@ REMEMBER: JSON ONLY. No \`\`\`. No prose. No trailing whitespace.`;
       throw new Error(`Could not JSON.parse model output: ${(err as Error).message}`);
     }
 
+    const parkingNorm =
+      typeof parsed.parking === 'string'
+        ? parsed.parking.trim().toUpperCase()
+        : null;
+    const parking: ParkingKind | undefined =
+      parkingNorm === 'GARAGE' || parkingNorm === 'PARKING' ? parkingNorm : undefined;
+    const parkingFeeRaw = this.toIntOrUndef(parsed.parkingFee);
+    // Treat 0 as a meaningful value ("included"); only set fee when parking is present.
+    const parkingFee = parking ? parkingFeeRaw : undefined;
+
     const costs: ParsedCosts = {
       rentPrice: this.toIntOrUndef(parsed.rentPrice),
       adminFee: this.toIntOrUndef(parsed.adminFee),
       utilities: this.toIntOrUndef(parsed.utilities),
       deposit: this.toIntOrUndef(parsed.deposit),
+      parking,
+      parkingFee,
       confidence:
         typeof parsed.costsConfidence === 'number'
           ? Math.max(0, Math.min(1, parsed.costsConfidence))

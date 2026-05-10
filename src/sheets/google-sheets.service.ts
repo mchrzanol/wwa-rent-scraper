@@ -22,6 +22,8 @@ const HEADER = [
   'Admin fee',
   'Total',
   'Deposit',
+  'Parking',
+  'Parking fee',
   'Walk (m)',
   'Walk approx?',
   'Nearest station',
@@ -144,11 +146,14 @@ export class GoogleSheetsService implements OnModuleInit {
     )?.properties?.sheetId;
     if (sheetId == null) return { checked: 0, removed: 0 };
 
-    // URL is column N (14th). Pull the entire column starting from row 2 to
-    // skip the header. Empty trailing rows are filtered by the API.
+    // Look up URL column dynamically — header order can shift when we add
+    // new columns. HEADER is 1-indexed via columnLetter.
+    const urlColIdx = HEADER.indexOf('URL');
+    if (urlColIdx < 0) return { checked: 0, removed: 0 };
+    const urlCol = columnLetter(urlColIdx + 1);
     const resp = await this.sheets.spreadsheets.values.get({
       spreadsheetId: this.config.sheets.spreadsheetId,
-      range: `${sheetName}!N2:N`,
+      range: `${sheetName}!${urlCol}2:${urlCol}`,
     });
     const urls = (resp.data.values ?? []).map((row) => (row[0] as string) ?? '');
     if (!urls.length) return { checked: 0, removed: 0 };
@@ -338,6 +343,8 @@ export class GoogleSheetsService implements OnModuleInit {
       l.adminFee ?? '',
       l.totalPrice,
       l.deposit ?? '',
+      l.parking === 'GARAGE' ? 'garaż' : l.parking === 'PARKING' ? 'parking' : '',
+      l.parkingFee ?? '',
       l.walkingMeters ?? l.haversineMeters,
       l.walkingApproximate,
       l.nearestStation,
